@@ -1,0 +1,6 @@
+[Unit]
+Description=Generate status page
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /home/noah/status-page/generate_status.py
