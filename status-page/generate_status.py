@@ -3,11 +3,23 @@
 import socket
 import subprocess
 import datetime
+import json
+import os
+import urllib.request
+import urllib.parse
+
+# --- CONFIG ---
+TELEGRAM_TOKEN = "your token here!"
+TELEGRAM_CHAT_ID = "your chat ID here!"
+HOSTNAME = "debian-server"
+STATE_FILE = "/var/lib/status-page/state.json"
+STATUS_OUTPUT = "/var/www/html/status/index.html"
 
 SERVICES = [
-    {"name": "My App", "Port": 8080, "systemd": "myapp"},
-   ]
+    {"name": "system name",        "port": 80,    "systemd": "system daemon"},
+]
 
+# --- CHECKS ---
 def check_port(port):
     if port is None:
         return None
@@ -32,13 +44,78 @@ def check_systemd(service):
 def get_status(svc):
     port_up = check_port(svc["port"])
     systemd_up = check_systemd(svc["systemd"])
-
     if port_up is False or systemd_up is False:
         return "down"
     if port_up is True or systemd_up is True:
         return "up"
     return "unknown"
 
+# --- TELEGRAM ---
+def send_telegram(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    data = urllib.parse.urlencode({
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML"
+    }).encode()
+    try:
+        urllib.request.urlopen(url, data, timeout=10)
+    except Exception as e:
+        print(f"Telegram error: {e}")
+
+# --- STATE ---
+def load_state():
+    if not os.path.exists(STATE_FILE):
+        return {}
+    try:
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
+    except:
+        return {}
+
+def save_state(state):
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f)
+
+# --- ALERTING ---
+def handle_alerts(results, previous_state, current_state):
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    for svc in results:
+        name = svc["name"]
+        current = svc["status"]
+        previous = previous_state.get(name)
+
+        if current == "down" and previous != "down":
+            message = (
+                f"🔴 <b>{name} is down</b>\n"
+                f"Host: {HOSTNAME}\n"
+                f"Time: {now}"
+            )
+            send_telegram(message)
+            current_state[name + "_down_since"] = now
+
+        elif current == "up" and previous == "down":
+            down_since = previous_state.get(name + "_down_since")
+            downtime = ""
+            if down_since:
+                try:
+                    fmt = "%Y-%m-%d %H:%M:%S"
+                    delta = datetime.datetime.now() - datetime.datetime.strptime(down_since, fmt)
+                    minutes = int(delta.total_seconds() / 60)
+                    downtime = f"\nDowntime: ~{minutes} minutes"
+                except:
+                    pass
+            message = (
+                f"✅ <b>{name} is back up</b>\n"
+                f"Host: {HOSTNAME}"
+                f"{downtime}\n"
+                f"Time: {now}"
+            )
+            send_telegram(message)
+
+# --- HTML ---
 def render_html(results):
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     all_up = all(r["status"] == "up" for r in results)
@@ -50,10 +127,8 @@ def render_html(results):
             "down":    '<span class="badge down">DOWN</span>',
             "unknown": '<span class="badge unknown">UNKNOWN</span>',
         }[r["status"]]
-
         port_str = str(r["port"]) if r["port"] else "—"
         systemd_str = r["systemd"] if r["systemd"] else "—"
-
         rows += f"""
         <tr>
             <td>{r['name']}</td>
@@ -109,8 +184,11 @@ def render_html(results):
 </body>
 </html>"""
 
+# --- MAIN ---
 if __name__ == "__main__":
+    previous_state = load_state()
     results = []
+
     for svc in SERVICES:
         results.append({
             "name":    svc["name"],
@@ -119,6 +197,11 @@ if __name__ == "__main__":
             "status":  get_status(svc),
         })
 
+    current_state = {r["name"]: r["status"] for r in results}
+    handle_alerts(results, previous_state, current_state)
+    save_state({**current_state, **{k: v for k, v in previous_state.items() if k.endswith("_down_since") and current_state.get(k.replace("_down_since", "")) == "down"}})
+
     html = render_html(results)
-    with open("/var/www/html/status/index.html", "w") as f:
+    os.makedirs(os.path.dirname(STATUS_OUTPUT), exist_ok=True)
+    with open(STATUS_OUTPUT, "w") as f:
         f.write(html)
